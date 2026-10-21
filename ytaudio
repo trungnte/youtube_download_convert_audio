@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# ytaudio — tải audio từ YouTube về máy Mac
+#
+# Cách dùng:
+#   ytaudio <url> [url...]          # tải mp3 (mặc định)
+#   ytaudio -f best <url>           # giữ nguyên audio gốc, không encode lại
+#   ytaudio -f flac <url>           # xuất FLAC
+#   ytaudio -p <playlist_url>       # tải cả playlist
+#   ytaudio                         # không có URL -> lấy link từ clipboard
+#
+# Tùy chọn:
+#   -f FORMAT   mp3 | m4a | opus | flac | wav | best   (mặc định: mp3)
+#   -o DIR      thư mục lưu (mặc định: ~/Music/YouTube)
+#   -p          cho phép tải cả playlist
+#   -h          trợ giúp
+
+set -euo pipefail
+
+FORMAT="m4a"
+OUT_DIR="${YTAUDIO_DIR:-$HOME/Download/music/YouTube}"
+PLAYLIST=0
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while getopts ":f:o:ph" opt; do
+  case "$opt" in
+    f) FORMAT="$(echo "$OPTARG" | tr '[:upper:]' '[:lower:]')" ;;
+    o) OUT_DIR="$OPTARG" ;;
+    p) PLAYLIST=1 ;;
+    h) usage 0 ;;
+    \?) echo "Tùy chọn không hợp lệ: -$OPTARG" >&2; usage 1 ;;
+    :)  echo "Tùy chọn -$OPTARG cần giá trị" >&2; usage 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# --- Kiểm tra công cụ phụ thuộc ---
+missing=()
+for bin in yt-dlp ffmpeg; do
+  command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
+done
+if (( ${#missing[@]} )); then
+  echo "Thiếu: ${missing[*]}" >&2
+  echo "Cài bằng Homebrew:  brew install ${missing[*]}" >&2
+  exit 1
+fi
+
+# --- Lấy danh sách URL ---
+urls=("$@")
+if (( ${#urls[@]} == 0 )); then
+  clip="$(pbpaste 2>/dev/null || true)"
+  if [[ "$clip" =~ ^https?://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/ ]]; then
+    echo "Dùng link từ clipboard: $clip"
+    urls=("$clip")
+  else
+    echo "Chưa có URL (và clipboard không chứa link YouTube)." >&2
+    usage 1
+  fi
+fi
+
+# --- Chuẩn hoá URL ---
+# zsh (url-quote-magic) hay chèn "\" trước ? = & khi dán link vào trong dấu ngoặc kép
+# -> bỏ hết "\" và tham số theo dõi si=; link /playlist?list= thì tự bật chế độ playlist
+for i in "${!urls[@]}"; do
+  u="${urls[$i]//\\/}"
+  u="$(echo "$u" | sed -E 's/([?&])si=[^&]*&?/\1/; s/[?&]$//')"
+  urls[$i]="$u"
+  [[ "$u" == *"/playlist?list="* ]] && PLAYLIST=1
+done
+
+mkdir -p "$OUT_DIR"
+
+# --- Cấu hình theo định dạng ---
+fmt_args=()
+case "$FORMAT" in
+  mp3)  fmt_args=(-f bestaudio --audio-format mp3 --audio-quality 0) ;;   # VBR ~245kbps
+  m4a)  fmt_args=(-f 'bestaudio[ext=m4a]/bestaudio' --audio-format m4a) ;;  # ưu tiên AAC gốc, không encode lại
+  opus) fmt_args=(-f 'bestaudio[acodec=opus]/bestaudio' --audio-format opus) ;;
+  flac) fmt_args=(-f bestaudio --audio-format flac) ;;
+  wav)  fmt_args=(-f bestaudio --audio-format wav) ;;
+  best) fmt_args=(-f bestaudio) ;;                                         # giữ nguyên codec gốc
+  *) echo "Định dạng không hỗ trợ: $FORMAT" >&2; usage 1 ;;
+esac
+
+# Ảnh bìa: wav không nhúng được
+thumb_args=(--embed-thumbnail --convert-thumbnails jpg)
+[[ "$FORMAT" == "wav" ]] && thumb_args=()
+
+playlist_args=(--no-playlist)
+out_tpl="%(title)s.%(ext)s"
+if (( PLAYLIST )); then
+  playlist_args=(--yes-playlist)
+  out_tpl="%(playlist_title|Singles)s/%(playlist_index|)s%(playlist_index& - |)s%(title)s.%(ext)s"
+fi
+
+echo "Định dạng: $FORMAT   →   $OUT_DIR"
+
+yt-dlp \
+  -x "${fmt_args[@]}" \
+  "${thumb_args[@]}" \
+  --embed-metadata \
+  --parse-metadata "%(artist,uploader)s:%(meta_artist)s" \
+  "${playlist_args[@]}" \
+  --windows-filenames \
+  --no-overwrites \
+  --progress \
+  -P "$OUT_DIR" \
+  -o "$out_tpl" \
+  "${urls[@]}"
+
+echo "✅ Xong. File nằm trong: $OUT_DIR"
+open "$OUT_DIR" 2>/dev/null || true
